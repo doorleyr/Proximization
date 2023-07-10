@@ -1,2 +1,6 @@
 .DS_Store
 __pycache__/
+examples/cambridge/CDD_LandUse
+examples/cambridge/BASEMAP_Buildings
+*checkpoint.ipynb
+*.ipynb_checkpoints/

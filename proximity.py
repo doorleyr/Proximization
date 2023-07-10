@@ -100,7 +100,7 @@ class Proximizer():
     - normalised_accessibility_X is the lesser of 1 (ineq 2) and the sum of normalised capacities of X in all reachable places (ineq 3)
     - normalised capacity of X in a place is capacity_p^x divided by inverse-access_p^x (eq 2)
     - different from previous model:
-        - capacity_p^x is persons_per_POI^x * N_units_p^x (where only N_units is a variable) (fixed input: potential_target_capacities)
+        - capacity_p^x is persons_per_POI^x * N_units_p^x (where only N_units is a variable) (fixed input: target_unit_capacities)
         - for each place, the sum over targets of units_p^x * Area^x can't exceed the area of the place (A_p: fixed input) (ineq 1)
         - met demand for X only sums over impact area (other areas still included as they still compete for capacity)
 
@@ -112,33 +112,42 @@ class Proximizer():
 
     """
     def __init__(self, reachable_s_t, demand_mat, ind_source_in_impact_area,
-                 potential_target_capacities, targets, 
-                 sqm_spaces, sqm_p_poi, norm_access_static=None, integer_amenities=True):
+                 target_unit_capacities, targets, 
+                 size_candidate_spaces, unit_size_target, norm_access_static=None, 
+                 integer_amenities=True, target_weights=None, min_capacity_ratio=0):
         self.n_source, self.n_design = reachable_s_t.shape
         self.n_targets=demand_mat.shape[1]
+        print('Calculating inverse Access')
         invA = np.dot(reachable_s_t.T,demand_mat)
         inv_invA=1/invA
         inv_invA[inv_invA == np.inf] = 0
         self.A_ub, self.b_ub = self.create_ineq_constraints(
-            reachable_s_t, norm_access_static, sqm_spaces, sqm_p_poi)
-        self.A_eq, self.b_eq = self.create_eq_constraints(demand_mat, inv_invA, potential_target_capacities, ind_source_in_impact_area)
-        self.c = self.create_obj_function(targets)
+            reachable_s_t, norm_access_static, size_candidate_spaces, unit_size_target)
+        self.A_eq, self.b_eq = self.create_eq_constraints(demand_mat, inv_invA, target_unit_capacities, ind_source_in_impact_area)
+        if target_weights is None:
+            target_weights=[1]*self.n_targets
+        self.c = self.create_obj_function(targets, target_unit_capacities, target_weights, min_capacity_ratio)
         self.integer_amenities=integer_amenities
         
-    def create_eq_constraints(self, demand_mat, inv_invA, potential_target_capacities, ind_source_in_impact_area):
+    def create_eq_constraints(self, demand_mat, inv_invA, target_unit_capacities, ind_source_in_impact_area):
+        print('Creating equality constraints')
         n_targets, n_design, n_source = self.n_targets, self.n_design, self.n_source
         # EQ CONSTRAINT 1: met demand of x is the sum over each source of the product of demand_X and normalised_accessibility_X
-        demand_mat[~ind_source_in_impact_area, :]=0
+        if ind_source_in_impact_area.sum()<len(demand_mat):
+            demand_mat[~ind_source_in_impact_area, :]=0
         temp=block_diag(*[demand_mat[:,i] for i in range(n_targets)])
+
+        print('Creating equality constraint 1')
 
         Aeq1=np.column_stack([
             -np.identity(n_targets), # LHS: the totals
             np.zeros([n_targets, (2*n_targets)*n_design]), # ignore  target bools, norm capacities of design cells
             temp]) # RHS: sum of demand*norm_access over all sources
         beq1=np.zeros(n_targets)    
-        
+
+        print('Creating equality constraint 2')
         # EQ CONSTRAINT 2: normalised target capacity is the capacity over the inverse access
-        diag=np.multiply(inv_invA.flatten('F'), potential_target_capacities)
+        diag=np.multiply(inv_invA.flatten('F'), target_unit_capacities)
 
         Aeq2=np.column_stack(
             [np.zeros([n_targets*n_design, n_targets]), #ignore totals
@@ -151,23 +160,27 @@ class Proximizer():
         b_eq=np.concatenate((beq1, beq2))
         return A_eq, b_eq
         
-    def create_ineq_constraints(self, reachable_s_t, norm_access_static, sqm_spaces, sqm_p_poi):
+    def create_ineq_constraints(self, reachable_s_t, norm_access_static, size_candidate_spaces, unit_size_target):
+        print('Creating inequality constraint 1')
         n_targets, n_design, n_source = self.n_targets, self.n_design, self.n_source
         # INEQUALITY CONSTRAINT 1: areas of assigned amenities can't exceed available area
         A1=np.column_stack([
             np.zeros([n_design, n_targets]), # total access vars
-            np.column_stack([sqm*np.identity(n_design) for sqm in sqm_p_poi]),
+            np.column_stack([size*np.identity(n_design) for size in unit_size_target]),
             np.zeros([n_design, n_design*n_targets]), # norm capacity vars
             np.zeros([n_design, n_source*n_targets])]) # norm access vars
 
-        b1 = sqm_spaces 
+        b1 = size_candidate_spaces 
+
+        print('Creating inequality constraint 2')
 
         # INEQUALITY CONSTRAINT 2: normalised access cant exceed 1
         A2=np.column_stack([
             np.zeros([n_source*n_targets, n_targets+n_design*(2*n_targets)]),# TODO: use separate lines for clarity
             np.identity(n_source*n_targets)])
         b2=np.ones(n_source*n_targets)
-
+        
+        print('Creating inequality constraint 3')
         block_diag_reachable=block_diag(*[reachable_s_t for i in range(n_targets)]).astype(int)
 
         # INEQUALITY CONSTRAINT 3: normalised access cant exceed the sum of the reachable normalised capacities
@@ -187,9 +200,19 @@ class Proximizer():
         
         return A_ub, b_ub
         
-    def create_obj_function(self, targets):
+    def create_obj_function(self, targets, target_unit_capacities, target_weights, min_capacity_ratio):
+        """
+        Function to be minimised:
+            - the sum of each met demand * -1 (effectively maximising the met demand)
+            - add the total capacity added * 0.3 (so that adding capacity won't improve the 
+            objective unless at least 30% at least 30% of it's capacity is added to the met demand- this prevents
+            capacity being added where the travl friction is very high)
+        """
         n_targets, n_design, n_source = self.n_targets, self.n_design, self.n_source
-        c = [-1 for t in targets] +[1e-6]*(n_design*n_targets) + [0]*(n_design*n_targets) + [0]*(n_source*n_targets)
+        c = ([-w for w in target_weights] 
+            # +[1e-6]*(n_design*n_targets) + 
+            +[min_capacity_ratio*c for c in list(target_unit_capacities)]+
+            [0]*(n_design*n_targets) + [0]*(n_source*n_targets))
         return c
         
     def solve(self):
@@ -438,7 +461,7 @@ class Proximize_Indicator(Indicator):
         print(reachable_s_t.shape)
 
         # - potential capacities of each design location for each possible target
-        potential_target_capacities=np.repeat(
+        target_unit_capacities=np.repeat(
             [self.p_per_poi_generative[target] for target in self.amenities_generative], len(target_spaces))
 
         # - demand for each target at each source location
@@ -456,7 +479,7 @@ class Proximize_Indicator(Indicator):
         
         print('Starting proximization')
         proximizer=Proximizer(reachable_s_t, demand_mat, ind_source_in_impact_area, 
-                              potential_target_capacities, self.amenities_generative, 
+                              target_unit_capacities, self.amenities_generative, 
                               sqm_target_spaces, self.sqm_p_poi_generative, 
                               norm_access_static, integer_amenities=self.integer_amenities)
         result = proximizer.solve()
